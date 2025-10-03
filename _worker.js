@@ -1,145 +1,150 @@
+import { connect } from "cloudflare:sockets";
+
+let password = '';
+// 强制落地 IP（默认）——如果希望由环境变量覆盖，可设置 env.PROXYIP
+let proxyIP = 'ProxyIP.Oracle.cmliussss.net';
+let DNS64Server = '';
+//let sub = '';
+let subConverter = atob('U1VCQVBfQ09OVkVSVEVS'); 
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
-      return await handleRequest(request, env);
+      if (typeof env.PROXYIP == 'string') proxyIP = env.PROXYIP;
+      if (typeof env.UUID == 'string') password = env.UUID.toLowerCase();
+      if (typeof env.DNS64 == 'string') DNS64Server = env.DNS64;
+      if (typeof env.SUBCONVERTER == 'string') subConverter = env.SUBCONVERTER;
+
+      const upgradeHeader = request.headers.get('Upgrade');
+      if (!upgradeHeader || upgradeHeader !== 'websocket') {
+        return new Response(JSON.stringify(request.cf), { status: 200 });
+      }
+      const [client, webSocket] = Object.values(new WebSocketPair());
+      webSocket.accept();
+      let address = '';
+      let portWithRandomLog = 443;
+      handleUDPOutBound(webSocket);
+      return new Response(null, { status: 101, webSocket: client });
     } catch (err) {
-      console.error("Worker error:", err);
-      return new Response("Internal Worker Error", { status: 500 });
+      return new Response('Error: ' + err.message, { status: 500 });
     }
-  },
+  }
 };
 
-async function handleRequest(request, env) {
-  const url = new URL(request.url);
+function handleUDPOutBound(webSocket) {
+  webSocket.addEventListener('message', async (event) => {
+    const data = event.data;
+    let addressRemote = '';
+    let portRemote = 0;
+    let log = (...args) => console.log(...args);
 
-  // ===== 固定代理出口 =====
-  const proxyIP = "ProxyIP.Oracle.cmliussss.net";
-
-  // ===== 密码处理 =====
-  const password = env.PASSWORD || "myStrongPassword";
-  const sha224Password = await sha224(password);
-  const sha256Password = await sha256(password);
-
-  // ===== 订阅接口 =====
-  if (url.pathname === "/" + password) {
-    let node = `trojan://${password}@${url.host}:443?peer=${proxyIP}#Trojan-Worker`;
-    return new Response(node, { status: 200, headers: { "Content-Type": "text/plain" } });
-  }
-
-  // ===== WebSocket 处理 =====
-  if (request.headers.get("Upgrade") === "websocket") {
-    return await trojanOverWSHandler(request, { sha224Password, sha256Password, proxyIP });
-  }
-
-  return new Response("Hello Worker!", { status: 200 });
-}
-
-/**
- * Trojan over WebSocket Handler
- */
-async function trojanOverWSHandler(request, { sha224Password, sha256Password, proxyIP }) {
-  const [client, server] = Object.values(new WebSocketPair());
-  server.accept();
-
-  server.addEventListener("message", async (event) => {
     try {
-      let data = event.data;
-      if (typeof data === "string") {
-        server.send("pong");
-        return;
+      if (data instanceof ArrayBuffer) {
+        const buffer = new Uint8Array(data);
+        const version = buffer[0];
+        if (version === 5) {
+          // Socks5
+          const cmd = buffer[1];
+          if (cmd === 1) {
+            const atyp = buffer[3];
+            let offset = 4;
+            if (atyp === 1) {
+              addressRemote = buffer.slice(offset, offset + 4).join('.');
+              offset += 4;
+            } else if (atyp === 3) {
+              const len = buffer[offset];
+              offset += 1;
+              addressRemote = new TextDecoder().decode(buffer.slice(offset, offset + len));
+              offset += len;
+            } else if (atyp === 4) {
+              addressRemote = buffer.slice(offset, offset + 16);
+              offset += 16;
+            }
+            portRemote = (buffer[offset] << 8) | buffer[offset + 1];
+            offset += 2;
+          }
+        }
       }
-
-      let parsed = parseTrojanHeader(new Uint8Array(await data.arrayBuffer()), sha224Password, sha256Password);
-      if (parsed.hasError) {
-        console.log("认证失败:", parsed.message);
-        server.close();
-        return;
+      if (addressRemote) {
+        handleTCPOutBound(webSocket, addressRemote, portRemote, log);
       }
-
-      console.log("认证成功, 目标:", parsed.address, parsed.port);
-
-      // === 强制走 ProxyIP 出口 ===
-      let connected = await connectProxy(proxyIP, parsed.address, parsed.port);
-
-      if (!connected) {
-        server.send("无法连接代理服务器");
-        server.close();
-        return;
-      }
-
-      server.send(`流量已落地到 ${proxyIP}, 转发目标 ${parsed.address}:${parsed.port}`);
-    } catch (err) {
-      console.error("WS error:", err);
-      server.close();
+    } catch (e) {
+      console.error('UDP outbound error', e);
+      webSocket.close();
     }
   });
-
-  return new Response(null, { status: 101, webSocket: client });
 }
 
-/**
- * 模拟连接代理服务器
- * 实际上这里应该改成 TCP/UDP 转发逻辑
- */
-async function connectProxy(proxyIP, targetHost, targetPort) {
+async function handleTCPOutBound(webSocket, addressRemote, portRemote, log) {
+  let enableSocks = false;
+  let enableHttp = false;
+  let tcpSocket;
+
+  // === START: 强制所有出站走 proxyIP ===
   try {
-    console.log(`连接代理: ${proxyIP} -> ${targetHost}:${targetPort}`);
-    // TODO: 在这里实现真正的 TCP 转发逻辑
-    return true;
+    if (proxyIP && proxyIP.trim() !== '') {
+      let forced = proxyIP.trim();
+      let forcedHost = forced;
+      let forcedPort = portRemote;
+      if (forced.startsWith('[') && forced.includes(']:')) {
+        const idx = forced.lastIndexOf(']:');
+        forcedHost = forced.slice(0, idx + 1);
+        forcedPort = Number(forced.slice(idx + 2)) || forcedPort;
+      } else if (forced.includes(':') && !forced.includes('http')) {
+        const parts = forced.split(':');
+        if (parts.length === 2) {
+          forcedHost = parts[0];
+          forcedPort = Number(parts[1]) || forcedPort;
+        }
+      }
+      addressRemote = forcedHost.toLowerCase();
+      portRemote = Number(forcedPort) || portRemote;
+      log(`强制落地代理: ${addressRemote}:${portRemote}`);
+    }
   } catch (e) {
-    console.error("代理连接失败:", e);
-    return false;
+    console.error('强制落地 proxyIP 解析错误:', e);
   }
-}
+  // === END: 强制所有出站走 proxyIP ===
 
-/**
- * 解析 Trojan 协议 Header
- */
-function parseTrojanHeader(buffer, sha224Password, sha256Password) {
-  if (buffer.byteLength < 56) {
-    return { hasError: true, message: "invalid length" };
+  async function retry() {
+    if (enableSocks) {
+      tcpSocket = await connectAndWrite(addressRemote, portRemote, true, enableHttp);
+    } else {
+      let p = proxyIP && proxyIP.trim() !== '' ? proxyIP.trim() : 'ProxyIP.Oracle.cmliussss.net';
+      let pHost = p;
+      let pPort = portRemote;
+      if (p.startsWith('[') && p.includes(']:')) {
+        const idx = p.lastIndexOf(']:');
+        pHost = p.slice(0, idx + 1);
+        pPort = Number(p.slice(idx + 2)) || pPort;
+      } else if (p.includes(':') && !p.startsWith('http')) {
+        const parts = p.split(':');
+        if (parts.length === 2) {
+          pHost = parts[0];
+          pPort = Number(parts[1]) || pPort;
+        }
+      }
+      tcpSocket = await connectAndWrite(pHost.toLowerCase() || addressRemote, pPort);
+    }
+    remoteSocketToWS(tcpSocket, webSocket, "ResponseHeader", false, log);
   }
 
-  let passwordHex = [...buffer.slice(0, 64)]
-    .map((x) => String.fromCharCode(x))
-    .join("")
-    .trim();
-
-  if (passwordHex !== sha224Password && passwordHex !== sha256Password) {
-    return { hasError: true, message: "invalid password" };
-  }
-
-  // TODO: 从 buffer 中解析目标地址和端口
-  return {
-    hasError: false,
-    address: "example.com",
-    port: 443,
-  };
+  tcpSocket = await connectAndWrite(addressRemote, portRemote);
+  remoteSocketToWS(tcpSocket, webSocket, "ResponseHeader", false, log);
 }
 
-/**
- * SHA224
- */
-async function sha224(message) {
-  const msgBuffer = new TextEncoder().encode(message);
-  const hashBuffer = await crypto.subtle.digest("SHA-224", msgBuffer);
-  return bufferToHex(hashBuffer);
+async function connectAndWrite(host, port, useSocks = false, useHttp = false) {
+  return await connect({ hostname: host, port: port });
 }
 
-/**
- * SHA256
- */
-async function sha256(message) {
-  const msgBuffer = new TextEncoder().encode(message);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
-  return bufferToHex(hashBuffer);
-}
-
-/**
- * ArrayBuffer → Hex
- */
-function bufferToHex(buffer) {
-  return [...new Uint8Array(buffer)]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+function remoteSocketToWS(tcpSocket, webSocket, responseHeader, nat64, log) {
+  (async () => {
+    try {
+      for await (const chunk of tcpSocket.readable) {
+        webSocket.send(chunk);
+      }
+    } catch (err) {
+      log('remoteSocketToWS error', err);
+    }
+  })();
 }
