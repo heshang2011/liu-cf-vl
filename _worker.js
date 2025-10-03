@@ -33,7 +33,7 @@ let proxyhosts = [];
 let proxyhostsURL = '';
 let 请求CF反代IP = 'false';
 let httpsPorts = ["2053", "2083", "2087", "2096", "8443"];
-let sha224Password;
+let sha256Password; // MODIFIED: Renamed to sha256Password
 const regex = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[.*\]):?(\d+)?#?(.*)?$/;
 let proxyIPPool = [];
 let path = '/?ed=2560';
@@ -92,8 +92,9 @@ export default {
                     }
                 });
             }
-            sha224Password = env.SHA224 || env.SHA224PASS || sha224(password);
-            //console.log(sha224Password);
+            // MODIFIED: Replaced sha224 with async sha256 call
+            sha256Password = env.SHA256 || env.SHA256PASS || await sha256(password);
+            //console.log(sha256Password);
 
             const currentDate = new Date();
             currentDate.setHours(0, 0, 0, 0); // 设置时间为当天
@@ -377,7 +378,8 @@ async function parse特洛伊Header(buffer) {
         };
     }
     const password = new TextDecoder().decode(buffer.slice(0, crLfIndex));
-    if (password !== sha224Password) {
+    // MODIFIED: Changed sha224Password to sha256Password
+    if (password !== sha256Password) {
         return {
             hasError: true,
             message: "invalid password"
@@ -637,6 +639,22 @@ function safeCloseWebSocket(socket) {
     } catch (error) {
         console.error("safeCloseWebSocket error", error);
     }
+}
+
+// MODIFIED: Added sha256 function to replace the missing sha224
+/**
+ * Calculates the SHA-256 hash of a string.
+ * @param {string} text The string to hash.
+ * @returns {Promise<string>} The hexadecimal representation of the hash.
+ */
+async function sha256(text) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(text);
+    // Cloudflare Workers' crypto.subtle supports 'SHA-256'
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return hashHex.toLowerCase();
 }
 
 /*
